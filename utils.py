@@ -17,26 +17,24 @@ def apply_ldp_noise(sens_true, rho):
 
 def backward_correction_loss(logits, noisy_labels, rho):
     """
-    Backward Correction Loss (对抗噪声)
+    [修改版] Backward Correction Loss (对抗噪声)
+    
+    原理: 构造无偏估计量，使得 E[Loss_corrected] = Loss_true
+    公式: L_unbiased = [ (1-rho) * L(y_noisy) - rho * L(1-y_noisy) ] / (1 - 2*rho)
     """
-    if rho > 0.499: rho = 0.49  # 避免除零
+    # 1. 边界保护，防止除零 (rho 通常 < 0.5)
+    rho = min(rho, 0.499)
     
-    # 基础 BCE Loss
-    probs = torch.sigmoid(logits)
+    # 2. 计算基于当前 noisy_labels 的损失 (Observed Loss)
+    loss_observed = F.binary_cross_entropy_with_logits(logits, noisy_labels, reduction='none')
     
-    # 构建校正矩阵 Q inverse
-    # P(s'|s) = [[1-rho, rho], [rho, 1-rho]]
-    # 我们希望优化的是 L(f(x), s_true)，但只有 s_noisy
-    # 使用 Backward Correction 公式
+    # 3. 计算基于反转标签的损失 (Flipped Loss)
+    loss_flipped = F.binary_cross_entropy_with_logits(logits, 1 - noisy_labels, reduction='none')
     
-    loss = F.binary_cross_entropy_with_logits(logits, noisy_labels, reduction='none')
+    # 4. 应用 Backward Correction 公式进行校正
+    corrected_loss = ((1 - rho) * loss_observed - rho * loss_flipped) / (1 - 2 * rho)
     
-    # 简化版 Correction: re-weighting
-    # 实际上，对于 Neural Network，直接用带噪标签训练+校正矩阵比较复杂
-    # 这里使用一个简单的加权技巧，或者直接返回 BCE (如果是简单 Baseline)
-    # 为了实现端到端效果，我们使用估计的 s_pred 去拟合 noisy_labels 的分布
-    
-    return loss.mean()
+    return corrected_loss.mean()
 
 def evaluate_performance(logits, true_labels):
     probs = torch.sigmoid(logits).detach().cpu().numpy()
