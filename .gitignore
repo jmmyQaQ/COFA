@@ -1,0 +1,13 @@
+# 忽略所有 PyTorch/Python 缓存
+__pycache__/
+*.py[cod]
+
+# 忽略所有大数据集文件
+*.bin
+data/credit/credit_edges.txt
+data/dblp/dblp.bin
+data/pokec_z/pokec_z.bin
+data/pokec_n/pokec_n.bin
+
+# 忽略系统文件
+.DS_Store
