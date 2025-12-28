@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 import pandas as pd
-import dgl
+# import dgl
 from torch_geometric.data import Data
 from sklearn.preprocessing import StandardScaler
 

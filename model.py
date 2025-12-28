@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, SAGEConv, APPNP
+from torch_geometric.nn import GCNConv, SAGEConv, APPNP, GraphConv
 
 # --- 敏感属性估计器 (始终使用 GCN 即可) ---
 class SensitiveEstimator(nn.Module):
@@ -31,8 +31,10 @@ class SurrogateModel(nn.Module):
             self.conv2 = GCNConv(hidden_dim, output_dim)
             
         elif model_name == 'GraphSAGE':
-            self.conv1 = SAGEConv(input_dim, hidden_dim)
-            self.conv2 = SAGEConv(hidden_dim, output_dim)
+            # [关键修改] SAGEConv 不支持 edge_weight，改用 GraphConv
+            # aggr='mean' 使其行为等同于带权重的 GraphSAGE
+            self.conv1 = GraphConv(input_dim, hidden_dim, aggr='mean')
+            self.conv2 = GraphConv(hidden_dim, output_dim, aggr='mean')
             
         elif model_name == 'APPNP':
             self.lin1 = nn.Linear(input_dim, hidden_dim)
@@ -48,11 +50,11 @@ class SurrogateModel(nn.Module):
             x = F.relu(self.lin1(x))
             x = F.dropout(x, p=self.dropout, training=self.training)
             x = self.lin2(x)
-            # APPNP 传播支持 edge_weight
             x = self.prop(x, edge_index, edge_weight)
             return x
             
-        else: # GCN, GraphSAGE, FairGNN(Backbone)
+        else: # GCN, GraphSAGE(via GraphConv), FairGNN
+            # 这里的接口都是统一的：(x, edge_index, edge_weight)
             x = self.conv1(x, edge_index, edge_weight)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)

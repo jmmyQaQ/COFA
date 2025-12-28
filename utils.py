@@ -17,7 +17,7 @@ def apply_ldp_noise(sens_true, rho):
 
 def backward_correction_loss(logits, noisy_labels, rho):
     """
-    [修改版] Backward Correction Loss (对抗噪声)
+    [修复版] Backward Correction Loss (对抗噪声)
     
     原理: 构造无偏估计量，使得 E[Loss_corrected] = Loss_true
     公式: L_unbiased = [ (1-rho) * L(y_noisy) - rho * L(1-y_noisy) ] / (1 - 2*rho)
