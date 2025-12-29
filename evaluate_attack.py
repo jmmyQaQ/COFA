@@ -143,7 +143,6 @@ def main():
     avg_poison_eo = np.mean(poison_results['eo'])
 
     # B. 极值对比 (Superiority Analysis)
-    # 取 Clean 中 Gap 最小的 (最公平的基准) vs Poisoned 中 Gap 最大的 (攻击破坏力最强的上限)
     min_clean_sp = np.min(clean_results['sp'])
     max_poison_sp = np.max(poison_results['sp'])
     
@@ -154,5 +153,21 @@ def main():
     print("FINAL RESULTS REPORT")
     print("="*60)
     
-    # 表头
-    print(f"{'Metric Strategy':<20} | {'Metric':<5} | {'Clean':<8} -> {'Poisoned':<8} | {'Delta':
+    # 表头 (之前报错的那一行，现在修复了)
+    print(f"{'Metric Strategy':<20} | {'Metric':<5} | {'Clean':<8} -> {'Poisoned':<8} | {'Delta':<8}")
+    print("-" * 60)
+    
+    # 1. Average Comparison
+    print(f"{'Average (Std)':<20} | {'Acc':<5} | {avg_clean_acc:.4f} -> {avg_poison_acc:.4f}   | {avg_poison_acc - avg_clean_acc:+.4f}")
+    print(f"{'':<20} | {'SP':<5} | {avg_clean_sp:.4f} -> {avg_poison_sp:.4f}   | {avg_poison_sp - avg_clean_sp:+.4f}")
+    print(f"{'':<20} | {'EO':<5} | {avg_clean_eo:.4f} -> {avg_poison_eo:.4f}   | {avg_poison_eo - avg_clean_eo:+.4f}")
+    
+    print("-" * 60)
+    
+    # 2. Min-Max Comparison
+    print(f"{'Min-Clean vs Max-Ptb':<20} | {'SP':<5} | {min_clean_sp:.4f} -> {max_poison_sp:.4f}   | {max_poison_sp - min_clean_sp:+.4f}")
+    print(f"{'':<20} | {'EO':<5} | {min_clean_eo:.4f} -> {max_poison_eo:.4f}   | {max_poison_eo - min_clean_eo:+.4f}")
+    print("="*60)
+
+if __name__ == "__main__":
+    main()
