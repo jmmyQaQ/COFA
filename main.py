@@ -7,7 +7,8 @@ import numpy as np
 from dataset import load_fairness_dataset
 from config import get_args
 from model import SensitiveEstimator, SurrogateModel
-from utils import backward_correction_loss, apply_ldp_noise
+# [引用修改] 引入新的估算函数
+from utils import backward_correction_loss, apply_ldp_noise, estimate_noise_parameter
 
 # ==============================================================================
 # 工具函数
@@ -26,7 +27,6 @@ def set_seed(seed):
 def ensure_masks(data, device):
     """
     确保所有数据集都有 train/val/test mask。
-    对于 bail, credit, german, dblp 等可能缺失 mask 的数据集进行随机划分。
     """
     if not hasattr(data, 'train_mask') or data.train_mask is None:
         num_nodes = data.num_nodes
@@ -104,8 +104,6 @@ def evaluate_metrics(output, labels, sens, mask):
 
 def test_victim_performance(data, adj_to_test, args, verbose=False):
     # 初始化受害者模型
-    # 注意: FairGNN 通常需要特殊参数，这里假设 model.py 中的 SurrogateModel 做了兼容封装
-    # 如果 FairGNN 需要 sens 输入，请确保 model.py 的 forward 能够处理
     victim_model = SurrogateModel(args.surrogate_model, data.num_features, args.hidden_dim, int(data.y.max().item())+1).to(args.device)
     optimizer = optim.Adam(victim_model.parameters(), lr=args.lr_sur, weight_decay=args.weight_decay)
     
@@ -114,7 +112,6 @@ def test_victim_performance(data, adj_to_test, args, verbose=False):
     
     for epoch in range(train_epochs):
         optimizer.zero_grad()
-        # 这里传入 None 作为 edge_weight，因为 adj_to_test 是离散的 edge_index
         output = victim_model(data.x, adj_to_test, None) 
         loss = F.cross_entropy(output[data.train_mask], data.y[data.train_mask])
         loss.backward()
@@ -144,13 +141,13 @@ def train_cofa():
         return
 
     # 2. 预处理
-    data = ensure_masks(data, device) # 确保有mask
+    data = ensure_masks(data, device) 
     if len(torch.unique(data.sens)) > 2:
-        data.sens = (data.sens > 0).float() # 二值化敏感属性
+        data.sens = (data.sens > 0).float() 
 
     # 计算类别权重
     y_train = data.y[data.train_mask]
-    if y_train.shape[0] == 0: # 防止空训练集报错
+    if y_train.shape[0] == 0: 
         class_weights = torch.ones(int(data.y.max().item())+1).to(device)
     else:
         class_counts = torch.bincount(y_train) + 1
@@ -158,9 +155,22 @@ def train_cofa():
         class_weights = class_weights / class_weights.sum() * len(class_counts)
         class_weights = class_weights.to(device)
 
-    # LDP 噪声
+    # ----------------------------------------------------
+    # LDP 环境模拟
+    # ----------------------------------------------------
     S_clean = data.sens
+    # 这里依然使用 args.noise_rate 来模拟真实的物理环境加噪
     S_noisy = apply_ldp_noise(S_clean, args.noise_rate).to(device)
+    
+    # [关键修改] 攻击者参数估算
+    # 攻击者不知道 args.noise_rate，只能通过 S_noisy 和先验知识反推
+    # 假设攻击者对该数据集有基本的宏观认识 (例如 German数据集中男性多，Prior设为0.7；若不确定则设0.5)
+    attacker_prior = 0.5 
+    if args.dataset.lower() in ['german', 'bail']:
+        attacker_prior = 0.7 # 简单的领域知识注入
+        
+    estimated_rho = estimate_noise_parameter(S_noisy, prior_pos_ratio=attacker_prior)
+
     kde_sample_points = torch.linspace(0, 1, 100, device=device)
 
     # ----------------------------------------------------
@@ -200,27 +210,30 @@ def train_cofa():
         estimator.train()
         surrogate.train()
         
-        # A. 构图
+        # A. 构图 (Gumbel Softmax)
         logits = base_w + P
         u = torch.rand_like(logits)
         gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
         edge_weight_soft = torch.sigmoid((logits + gumbel_noise) / 1.0)
         
-        # B. Estimator Update
+        # B. Estimator Update (使用估算的 estimated_rho)
         s_logits = estimator(data.x, candidate_edge_index, edge_weight_soft)
-        loss_est = backward_correction_loss(s_logits.squeeze(), S_noisy, args.noise_rate)
+        # [修改点] 这里不再传入 args.noise_rate，而是传入 estimated_rho
+        loss_est = backward_correction_loss(s_logits.squeeze(), S_noisy, estimated_rho)
 
         # C. Surrogate Update
         y_logits = surrogate(data.x, candidate_edge_index, edge_weight_soft)
         loss_util = F.cross_entropy(y_logits[data.train_mask], data.y[data.train_mask], weight=class_weights)
         
-        # D. Wasserstein Attack
+        # D. Attack Optimization (升级版: 增加定向歧视)
         s_probs_detached = torch.sigmoid(s_logits).squeeze().detach()
         prob_s1 = s_probs_detached
         prob_s0 = 1 - s_probs_detached
         
+        # 获取预测为正类(Y=1)的概率
         y_pred_prob = F.softmax(y_logits, dim=1)[:, 1] if y_logits.shape[1] > 1 else torch.sigmoid(y_logits).squeeze()
 
+        # D1. Wasserstein Loss (拉大两个群体的预测分布距离)
         pdf_s1 = estimate_density(y_pred_prob, prob_s1, kde_sample_points, sigma=0.05)
         pdf_s0 = estimate_density(y_pred_prob, prob_s0, kde_sample_points, sigma=0.05)
         
@@ -230,7 +243,18 @@ def train_cofa():
         cdf_s0 = cdf_s0 / (cdf_s0[-1] + 1e-6)
         
         dist_wasserstein = torch.sum(torch.abs(cdf_s1 - cdf_s0))
-        loss_attack = - dist_wasserstein
+        
+        # D2. [新增] Directional Discrimination Loss (定向歧视)
+        # 目标: 压低敏感群体(S=1)的预测概率，抬高非敏感群体(S=0)的预测概率
+        mean_pred_s1 = (y_pred_prob * prob_s1).sum() / (prob_s1.sum() + 1e-6)
+        mean_pred_s0 = (y_pred_prob * prob_s0).sum() / (prob_s0.sum() + 1e-6)
+        
+        # 我们希望 (mean_pred_s0 - mean_pred_s1) 越大越好 -> Loss 越小越好
+        loss_discrimination = mean_pred_s1 - mean_pred_s0
+        
+        # 组合 Loss: 既要分布差异大，又要方向是恶意的
+        # 这里权重系数 0.5 可以根据实验微调，暂时写死或作为超参
+        loss_attack = - dist_wasserstein + 1.0 * loss_discrimination
         
         total_loss = loss_est + args.lambda_fair * loss_attack + 0.5 * loss_util
         
@@ -250,10 +274,9 @@ def train_cofa():
         _, top_indices = torch.topk(final_scores, budget_edges)
         final_edge_index = candidate_edge_index[:, top_indices]
 
-    # 7. 攻击后评估 (Poisoned Evaluation)
+    # 7. 攻击后评估
     poison_acc, poison_sp, poison_eo = test_victim_performance(data, final_edge_index, args)
     
-    # 格式: FINAL_RESULT,dataset,model,seed,clean_acc,clean_sp,clean_eo,poison_acc,poison_sp,poison_eo
     print(f"FINAL_RESULT,{args.dataset},{args.surrogate_model},{args.seed},{clean_acc:.4f},{clean_sp:.4f},{clean_eo:.4f},{poison_acc:.4f},{poison_sp:.4f},{poison_eo:.4f}")
 
 if __name__ == "__main__":

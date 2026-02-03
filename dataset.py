@@ -49,10 +49,20 @@ def dgl_to_pyg(g):
     edge_index = torch.stack([u, v], dim=0).long()
     
     # 2. 提取节点特征 (ndata)
-    # 尝试常见的键名
+    # 【修复点】添加 'feature' (单数) 到查找列表
     x = g.ndata.get('feat', g.ndata.get('features', g.ndata.get('x')))
+    
+    if x is None:
+        # 你的数据用的是 'feature'
+        x = g.ndata.get('feature', g.ndata.get('attr'))
+    
+    if x is None:
+        # 最后的保底尝试
+        x = g.ndata.get('h')
+
+    # 提取标签和敏感属性
     y = g.ndata.get('label', g.ndata.get('labels', g.ndata.get('y')))
-    sens = g.ndata.get('sens', g.ndata.get('sensitive', g.ndata.get('val'))) # NIFA 有时用 val 代表 sensitive
+    sens = g.ndata.get('sens', g.ndata.get('sensitive', g.ndata.get('val')))
     
     # 如果找不到，尝试查找含有 'sens' 字样的 key
     if sens is None:
@@ -62,13 +72,23 @@ def dgl_to_pyg(g):
                 break
     
     if x is None:
-        raise ValueError("DGL Graph missing 'feat' or 'x' in ndata.")
+        raise ValueError(f"DGL Graph missing 'feature', 'feat', 'x' or 'attr' in ndata. Available keys: {list(g.ndata.keys())}")
     
     # 3. 构建 Data
     data = Data(x=x, edge_index=edge_index, y=y)
     if sens is not None:
         data.sens = sens.float() # 转换为 float 供攻击模型使用
     
+    # 4. (可选) 如果数据里有划分好的 masks，也可以提取出来
+    # 根据你的报错日志，数据里包含 'train_index', 'val_index', 'test_index'
+    # 这里简单处理，如果有需要可以在 main.py 里利用它们
+    if 'train_index' in g.ndata:
+        data.train_mask = g.ndata['train_index'].bool()
+    if 'val_index' in g.ndata:
+        data.val_mask = g.ndata['val_index'].bool()
+    if 'test_index' in g.ndata:
+        data.test_mask = g.ndata['test_index'].bool()
+
     return data
 
 # === 核心加载逻辑 (PyG + DGL + CSV) ===
@@ -120,7 +140,9 @@ def load_fairness_dataset(dataset, root_dir='./data'):
                 data = dgl_to_pyg(g)
                 print(f"  > Converted DGL graph to PyG Data object.")
             except Exception as e_dgl:
-                # 不是 DGL 格式，或者加载失败，继续尝试下一个
+                print(f"  > [DGL Load Error] Failed to convert DGL graph: {e_dgl}")
+                if 'glist' in locals() and len(glist) > 0:
+                     print(f"  > [Debug info] Available ndata keys in loaded graph: {list(glist[0].ndata.keys())}")
                 pass
         
         # --- 策略 B: PyTorch Load ---
@@ -165,17 +187,25 @@ def load_fairness_dataset(dataset, root_dir='./data'):
             # 属性检查
             if not hasattr(data, 'sens') or data.sens is None:
                  print(f"Warning: Loaded data missing 'sens'. Keys: {data.keys if hasattr(data, 'keys') else 'unknown'}")
-                 raise ValueError(f"Loaded {dataset} binary data missing 'sens' attribute.")
+                 print("  > [Warning] 'sens' attribute missing in binary data. Attack might fail.")
+            else:
+                 data.sens = data.sens.float()
             
-            data.sens = data.sens.float()
+            # 【关键修复】清洗标签：防止出现 -1 导致的 CUDA Error
+            if data.y is not None:
+                data.y = data.y.long() # 确保是整数类型
+                if data.y.min() < 0:
+                    print(f"  > [Data Fix] Found negative labels (min: {data.y.min().item()}). Replacing -1 with 0 to prevent crash.")
+                    data.y[data.y < 0] = 0
+            
             if not hasattr(data, 'num_nodes') or data.num_nodes is None:
-                data.num_nodes = data.x.shape[0]
+                if data.x is not None:
+                    data.num_nodes = data.x.shape[0]
             
-            print(f"  > Done! Nodes: {data.num_nodes}, Edges: {data.edge_index.shape[1]}")
+            print(f"  > Done! Nodes: {data.num_nodes}, Edges: {data.edge_index.shape[1] if data.edge_index is not None else '?'}")
             return data
         else:
             print(f"  > Failed to load binary file with DGL, Torch, or Numpy.")
-
     # ---------------------------------------------------------
     # 2. 回退到 CSV 加载模式
     # ---------------------------------------------------------
